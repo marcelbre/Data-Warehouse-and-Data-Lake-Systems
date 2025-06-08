@@ -1,0 +1,77 @@
+import json
+import boto3
+import requests
+import os
+from datetime import datetime
+
+def fetch_and_format_weekly_data(symbol, api_key):
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "TIME_SERIES_WEEKLY_ADJUSTED",
+        "symbol": symbol,
+        "apikey": api_key
+    }
+
+    response = requests.get(url, params=params)
+    data = response.json()
+
+    time_series = data.get("Weekly Adjusted Time Series", {})
+    formatted_data = []
+
+    for date, values in time_series.items():
+        formatted_data.append({
+            "symbol": symbol,
+            "date": date,
+            "open": float(values["1. open"]),
+            "high": float(values["2. high"]),
+            "low": float(values["3. low"]),
+            "close": float(values["4. close"]),
+            "adjusted_close": float(values["5. adjusted close"]),
+            "volume": int(values["6. volume"]),
+            "dividend_amount": float(values.get("7. dividend amount", 0))
+        })
+
+    return formatted_data
+
+def lambda_handler(event, context):
+    bucket_name = os.environ.get('BUCKET_NAME', 'ai-sentiment-pipeline')
+    api_key = os.environ.get('ALPHAVANTAGE_API_KEY')
+    s3 = boto3.client("s3")
+
+    symbols = ["PLTR", "PANW", "TTD"]
+    timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")
+    results = []
+
+    for symbol in symbols:
+        try:
+            weekly_data = fetch_and_format_weekly_data(symbol, api_key)
+
+            if weekly_data:
+                json_data = json.dumps(weekly_data, default=str)
+                s3_key = f"raw/stock/weekly/{symbol}_weekly_{timestamp}.json"
+
+                s3.put_object(Bucket=bucket_name, Key=s3_key, Body=json_data)
+
+                results.append({
+                    "symbol": symbol,
+                    "status": "success",
+                    "saved_to": f"s3://{bucket_name}/{s3_key}",
+                    "records": len(weekly_data)
+                })
+            else:
+                results.append({
+                    "symbol": symbol,
+                    "status": "no data found"
+                })
+
+        except Exception as e:
+            results.append({
+                "symbol": symbol,
+                "status": "error",
+                "message": str(e)
+            })
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(results)
+    }

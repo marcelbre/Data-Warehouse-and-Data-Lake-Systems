@@ -1,0 +1,42 @@
+import sys
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+# === Glue boilerplate ===
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# === 1) Read JSON arrays directly with Spark ===
+df = (spark
+    .read
+    .option("multiLine", True)      # important for top-level arrays
+    .json("s3://ai-sentiment-pipeline/raw/stock/weekly/*.json")
+)
+
+print("Schema after JSON load:")
+df.printSchema()
+print("Sample rows:")
+df.show(5)
+
+# === 2) Deduplicate if symbol + date exist ===
+if {'symbol','date'}.issubset(set(df.columns)):
+    df_clean = df.dropDuplicates(['symbol','date'])
+else:
+    df_clean = df.dropDuplicates()
+print("Row count after dedupe:", df_clean.count())
+
+# === 3) Write to S3 in curated/stock/ as Parquet ===
+(df_clean
+    .write
+    .mode("overwrite")
+    .option("compression", "snappy")
+    .parquet("s3://ai-sentiment-pipeline/curated/stock")
+)
+
+job.commit()

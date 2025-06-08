@@ -1,0 +1,61 @@
+import sys
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col, to_timestamp
+
+# 1) Glue boilerplate
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# 2) Read raw Reddit JSON (top-level arrays) directly from S3
+df = (spark
+    .read
+    .option("multiLine", True) 
+    .json("s3://ai-sentiment-pipeline/raw/reddit/*.json")
+)
+
+# 3) Inspect and flatten (if necessary)
+# Spark will handle arrays at top level when multiLine=True – each object becomes a row
+df_flat = df
+
+# 4) Parse timestamp and unpack sentiment struct into columns
+df_clean = (
+    df_flat
+      # parse the created_utc string into a real Timestamp
+      .withColumn("created_ts", to_timestamp(col("created_utc")))
+      # pull sentiment struct into top-level columns
+      .select(
+         "post_id",
+         "asset",
+         "title",
+         "author",
+         "user_karma",
+         "url",
+         "score",
+         "created_ts",
+         col("sentiment.neg").alias("sent_neg"),
+         col("sentiment.neu").alias("sent_neu"),
+         col("sentiment.pos").alias("sent_pos"),
+         col("sentiment.compound").alias("sent_compound")
+      )
+)
+
+# 5) (Optional) remove any exact duplicate posts
+df_clean = df_clean.dropDuplicates(["post_id"])
+
+# 6) Write out to Parquet under curated/reddit/
+(df_clean
+   .write
+   .mode("overwrite")
+   .option("compression", "snappy")
+   .parquet("s3://ai-sentiment-pipeline/curated/reddit")
+)
+
+# 7) Finish
+job.commit()

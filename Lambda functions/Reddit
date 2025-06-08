@@ -1,0 +1,165 @@
+import boto3
+import praw
+import datetime
+import os
+import time
+import json
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+# === Reddit API credentials from env vars
+REDDIT_CLIENT_ID = os.environ['REDDIT_CLIENT_ID']
+REDDIT_CLIENT_SECRET = os.environ['REDDIT_CLIENT_SECRET']
+REDDIT_USER_AGENT = os.environ['REDDIT_USER_AGENT']
+
+# === Config
+SUBREDDIT = "ArtificialIntelligence+OpenAI+AI_Startup+ChatGPT+stocks+investing+technology+MachineLearning"
+MIN_USER_KARMA = 10
+POST_LIMIT = 1000
+MAX_PROCESSING_TIME = 3000
+S3_BUCKET = 'ai-sentiment-pipeline'
+
+# === AWS clients
+s3 = boto3.client('s3')
+
+# === Init Reddit client
+reddit = praw.Reddit(
+    client_id=REDDIT_CLIENT_ID,
+    client_secret=REDDIT_CLIENT_SECRET,
+    user_agent=REDDIT_USER_AGENT
+)
+
+print(f"Authenticated Reddit user: {reddit.user.me()}")
+
+# === Sentiment Analyzer
+analyzer = SentimentIntensityAnalyzer()
+
+def analyze_sentiment(text):
+    return analyzer.polarity_scores(text)
+
+# === Save posts to S3
+def save_to_s3(posts, asset_name):
+    if not posts:
+        return
+
+    timestamp = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%SZ')
+    key = f"raw/reddit/{timestamp}_{asset_name}.json"
+
+    try:
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=json.dumps(posts, default=str),
+            ContentType='application/json'
+        )
+        print(f"Saved {len(posts)} posts for {asset_name} to S3 at {key}")
+    except Exception as e:
+        print(f"Failed to save posts for {asset_name} to S3: {e}")
+
+# === Fetch Reddit posts
+def fetch_reddit_posts(asset_name, aliases, timeout=60):
+    collected = []
+    query = " OR ".join(aliases)
+    start_time = time.time()
+
+    try:
+        for post in reddit.subreddit(SUBREDDIT).search(
+            query,
+            sort="relevance",
+            time_filter="year",
+            limit=POST_LIMIT
+        ):
+            if time.time() - start_time > timeout:
+                print(f"Timeout fetching posts for {asset_name} after {len(collected)} results")
+                break
+
+            user_karma = None
+            try:
+                if post.author:
+                    user_karma = post.author.link_karma + post.author.comment_karma
+            except Exception:
+                pass
+
+            if user_karma is not None and user_karma >= MIN_USER_KARMA:
+                sentiment = analyze_sentiment(post.title)
+                collected.append({
+                    "post_id": post.id,
+                    "asset": asset_name,
+                    "title": post.title,
+                    "created_utc": str(datetime.datetime.fromtimestamp(post.created_utc)),
+                    "author": str(post.author),
+                    "user_karma": user_karma,
+                    "sentiment": sentiment,
+                    "url": post.url,
+                    "score": post.score
+                })
+    except Exception as e:
+        print(f"Error searching for {asset_name}: {e}")
+
+    return collected
+
+# === Process one asset (e.g., openai, anthropic)
+def process_asset(asset):
+    name = asset.get("id")
+    aliases = asset.get("aliases", [name, asset.get("symbol", "")])
+    
+    print(f"🔍 Searching Reddit for: {name} using aliases {aliases}")
+    posts = fetch_reddit_posts(name, aliases, timeout=60)
+    print(f"Found {len(posts)} posts for {name}")
+
+    # Sentiment summary
+    positive = sum(1 for post in posts if post["sentiment"]["compound"] >= 0.05)
+    negative = sum(1 for post in posts if post["sentiment"]["compound"] <= -0.05)
+    neutral = len(posts) - positive - negative
+
+    # Save to S3
+    save_to_s3(posts, name)
+
+    return {
+        "posts": posts,
+        "sentiment_summary": {
+            "asset": name,
+            "positive": positive,
+            "negative": negative,
+            "neutral": neutral,
+            "total": len(posts)
+        }
+    }
+
+# === Lambda handler
+def lambda_handler(event, context):
+    start_time = time.time()
+    assets = event.get("assets", [])
+    all_posts = []
+    sentiment_results = {}
+
+    max_end_time = start_time + MAX_PROCESSING_TIME
+    max_assets_per_batch = 3
+
+    for i in range(0, len(assets), max_assets_per_batch):
+        if time.time() > max_end_time:
+            print(f" Timeout limit approaching, processed {i} of {len(assets)}")
+            break
+
+        batch = assets[i:i+max_assets_per_batch]
+        for asset in batch:
+            try:
+                result = process_asset(asset)
+                all_posts.extend(result["posts"])
+                sentiment_results[result["sentiment_summary"]["asset"]] = result["sentiment_summary"]
+            except Exception as e:
+                print(f" Error processing asset {asset.get('id')}: {e}")
+
+    if not all_posts:
+        print("No posts found.")
+
+    execution_time = time.time() - start_time
+    print(f"Total execution time: {execution_time:.2f} seconds")
+
+    return {
+        "statusCode": 200,
+        "total_posts_saved": len(all_posts),
+        "sentiment_results": sentiment_results,
+        "execution_time": execution_time
+    }
+
+
